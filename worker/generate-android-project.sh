@@ -131,9 +131,9 @@ cat > "$OUT/app/src/main/res/values/strings.xml" <<EOF
 <resources><string name="app_name">$XML_APP_NAME</string></resources>
 EOF
 
-# Minimal placeholder launcher icon (1x1 transparent PNG)
-printf '\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01\x08\x06\x00\x00\x00\x1f\x15\xc4\x89\x00\x00\x00\rIDATx\x9cc\x00\x01\x00\x00\x05\x00\x01\r\n-\xb4\x00\x00\x00\x00IEND\xaeB`\x82' \
-  > "$OUT/app/src/main/res/mipmap-mdpi/ic_launcher.png"
+# Minimal valid launcher icon (1x1 PNG, base64-decoded to avoid escaping issues)
+printf '%s' 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==' \
+  | base64 -d > "$OUT/app/src/main/res/mipmap-mdpi/ic_launcher.png"
 
 # Gradle wrapper
 cd "$OUT"
