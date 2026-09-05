@@ -1,0 +1,182 @@
+name: Build APK Worker
+
+on:
+  workflow_dispatch:
+  schedule:
+    # Poll queue every 5 minutes
+    - cron: "*/5 * * * *"
+
+concurrency:
+  group: apk-build-worker
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Claim next queued build
+        id: claim
+        env:
+          API_BASE: ${{ secrets.LOVABLE_API_BASE }}
+          WORKER_SECRET: ${{ secrets.BUILD_WORKER_SECRET }}
+        run: |
+          set -e
+          resp=$(curl -sS -X POST "$API_BASE/api/public/builds/next" \
+            -H "Authorization: Bearer $WORKER_SECRET")
+          echo "$resp" > /tmp/claim.json
+          if [ "$(jq 'has("error")' /tmp/claim.json)" = "true" ]; then
+            echo "::error::$(jq -r '.error' /tmp/claim.json)"; exit 1
+          fi
+          if [ "$(jq -r '.build' /tmp/claim.json)" = "null" ]; then
+            echo "No queued builds."; echo "has_build=false" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          echo "has_build=true" >> "$GITHUB_OUTPUT"
+          echo "build_id=$(jq -r '.build.id' /tmp/claim.json)" >> "$GITHUB_OUTPUT"
+          echo "build_type=$(jq -r '.build.build_type' /tmp/claim.json)" >> "$GITHUB_OUTPUT"
+          {
+            echo "app_name<<EOF"
+            jq -r '.project.name' /tmp/claim.json
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+          pkg=$(jq -r '.project.package_name // "app.generated.demo"' /tmp/claim.json)
+          echo "package_name=$pkg" >> "$GITHUB_OUTPUT"
+
+      - name: Report worker start
+        if: steps.claim.outputs.has_build == 'true'
+        env:
+          API_BASE: ${{ secrets.LOVABLE_API_BASE }}
+          WORKER_SECRET: ${{ secrets.BUILD_WORKER_SECRET }}
+          BUILD_ID: ${{ steps.claim.outputs.build_id }}
+          BUILD_TYPE: ${{ steps.claim.outputs.build_type }}
+        run: |
+          jq -n --arg l "\n[worker] [1/5] GitHub Actions worker отримав завдання для ${BUILD_TYPE^^}.\n" '{status:"running", appendLogs:$l}' \
+            | curl -sS -X POST "$API_BASE/api/public/builds/$BUILD_ID/status" \
+                -H "Authorization: Bearer $WORKER_SECRET" \
+                -H "Content-Type: application/json" \
+                --data-binary @-
+
+      - name: Setup JDK 17
+        if: steps.claim.outputs.has_build == 'true'
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Setup Android SDK
+        if: steps.claim.outputs.has_build == 'true'
+        uses: android-actions/setup-android@v3
+
+      - name: Setup Gradle
+        if: steps.claim.outputs.has_build == 'true'
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.7"
+
+      - name: Generate Android project
+        if: steps.claim.outputs.has_build == 'true'
+        env:
+          APP_NAME: ${{ steps.claim.outputs.app_name }}
+          PACKAGE_NAME: ${{ steps.claim.outputs.package_name }}
+          BUILD_TYPE: ${{ steps.claim.outputs.build_type }}
+          API_BASE: ${{ secrets.LOVABLE_API_BASE }}
+          WORKER_SECRET: ${{ secrets.BUILD_WORKER_SECRET }}
+          BUILD_ID: ${{ steps.claim.outputs.build_id }}
+        run: |
+          set -euo pipefail
+          jq -n --arg l "[worker] [2/5] Генеруємо Android-проєкт і Gradle конфігурацію.\n" '{appendLogs:$l}' \
+            | curl -sS -X POST "$API_BASE/api/public/builds/$BUILD_ID/status" \
+                -H "Authorization: Bearer $WORKER_SECRET" -H "Content-Type: application/json" --data-binary @-
+          bash worker/generate-android-project.sh /tmp/android-app
+
+      - name: Build Android artifact
+        if: steps.claim.outputs.has_build == 'true'
+        working-directory: /tmp/android-app
+        env:
+          BUILD_TYPE: ${{ steps.claim.outputs.build_type }}
+          API_BASE: ${{ secrets.LOVABLE_API_BASE }}
+          WORKER_SECRET: ${{ secrets.BUILD_WORKER_SECRET }}
+          BUILD_ID: ${{ steps.claim.outputs.build_id }}
+        run: |
+          set -euo pipefail
+          jq -n --arg l "[worker] [3/5] Запускаємо Gradle build для ${BUILD_TYPE^^}.\n" '{appendLogs:$l}' \
+            | curl -sS -X POST "$API_BASE/api/public/builds/$BUILD_ID/status" \
+                -H "Authorization: Bearer $WORKER_SECRET" -H "Content-Type: application/json" --data-binary @-
+          chmod +x ./gradlew
+          if [ "$BUILD_TYPE" = "aab" ]; then
+            ./gradlew bundleRelease --no-daemon --stacktrace 2>&1 | tee /tmp/build.log
+            ls -la app/build/outputs/bundle/release/
+          else
+            ./gradlew assembleRelease --no-daemon --stacktrace 2>&1 | tee /tmp/build.log
+            ls -la app/build/outputs/apk/release/
+          fi
+          logs=$(tail -c 50000 /tmp/build.log)
+          jq -n --arg l "\n[worker] [4/5] Gradle завершив збірку.\n$logs\n" '{appendLogs:$l}' \
+            | curl -sS -X POST "$API_BASE/api/public/builds/$BUILD_ID/status" \
+                -H "Authorization: Bearer $WORKER_SECRET" -H "Content-Type: application/json" --data-binary @-
+
+      - name: Verify APK signature (apksigner)
+        if: steps.claim.outputs.has_build == 'true' && steps.claim.outputs.build_type != 'aab'
+        env:
+          API_BASE: ${{ secrets.LOVABLE_API_BASE }}
+          WORKER_SECRET: ${{ secrets.BUILD_WORKER_SECRET }}
+          BUILD_ID: ${{ steps.claim.outputs.build_id }}
+        run: |
+          set -euo pipefail
+          apk=$(ls /tmp/android-app/app/build/outputs/apk/release/*.apk | head -n1)
+          apksigner=$(ls "$ANDROID_HOME"/build-tools/*/apksigner | sort -V | tail -n1)
+          echo "Using $apksigner"
+          if ! "$apksigner" verify --verbose --print-certs "$apk" > /tmp/verify.log 2>&1; then
+            out=$(cat /tmp/verify.log)
+            jq -n --arg l "\n[worker] ❌ Перевірка підпису НЕ пройдена — файл не встановиться на телефон.\n$out\n" \
+              '{status:"failed", appendLogs:$l}' \
+              | curl -sS -X POST "$API_BASE/api/public/builds/$BUILD_ID/status" \
+                  -H "Authorization: Bearer $WORKER_SECRET" -H "Content-Type: application/json" --data-binary @-
+            echo "::error::APK signature verification failed"
+            exit 1
+          fi
+          out=$(cat /tmp/verify.log)
+          jq -n --arg l "\n[worker] ✅ Підпис APK перевірено (apksigner verify OK) — файл можна інсталювати.\n$out\n" \
+            '{appendLogs:$l}' \
+            | curl -sS -X POST "$API_BASE/api/public/builds/$BUILD_ID/status" \
+                -H "Authorization: Bearer $WORKER_SECRET" -H "Content-Type: application/json" --data-binary @-
+
+      - name: Upload artifact to platform
+
+        if: steps.claim.outputs.has_build == 'true'
+        env:
+          API_BASE: ${{ secrets.LOVABLE_API_BASE }}
+          WORKER_SECRET: ${{ secrets.BUILD_WORKER_SECRET }}
+          BUILD_ID: ${{ steps.claim.outputs.build_id }}
+          BUILD_TYPE: ${{ steps.claim.outputs.build_type }}
+        run: |
+          set -euo pipefail
+          if [ "$BUILD_TYPE" = "aab" ]; then
+            artifact=$(ls /tmp/android-app/app/build/outputs/bundle/release/*.aab | head -n1)
+            content_type="application/octet-stream"
+          else
+            artifact=$(ls /tmp/android-app/app/build/outputs/apk/release/*.apk | head -n1)
+            content_type="application/vnd.android.package-archive"
+          fi
+          echo "Uploading $artifact ($(du -h "$artifact" | cut -f1))"
+          curl -sS -f -X POST "$API_BASE/api/public/builds/$BUILD_ID/artifact" \
+            -H "Authorization: Bearer $WORKER_SECRET" \
+            -H "Content-Type: $content_type" \
+            --data-binary "@$artifact"
+
+      - name: Report failure
+        if: failure() && steps.claim.outputs.has_build == 'true'
+        env:
+          API_BASE: ${{ secrets.LOVABLE_API_BASE }}
+          WORKER_SECRET: ${{ secrets.BUILD_WORKER_SECRET }}
+          BUILD_ID: ${{ steps.claim.outputs.build_id }}
+        run: |
+          logs=$(tail -c 100000 /tmp/build.log 2>/dev/null || echo "worker failed before build")
+          jq -n --arg s "failed" --arg l "$logs" '{status:$s, appendLogs:("\n[worker] BUILD FAILED\n"+$l)}' \
+            | curl -sS -X POST "$API_BASE/api/public/builds/$BUILD_ID/status" \
+                -H "Authorization: Bearer $WORKER_SECRET" \
+                -H "Content-Type: application/json" \
+                --data-binary @-
