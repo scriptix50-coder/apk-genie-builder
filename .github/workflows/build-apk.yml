@@ -63,12 +63,9 @@ jobs:
         if: steps.claim.outputs.has_build == 'true'
         uses: actions/setup-java@v4
         with:
-          distribution: temurin
+          distribution: temuring
           java-version: "17"
 
-      - name: Setup Android SDK
-        if: steps.claim.outputs.has_build == 'true'
-        uses: android-actions/setup-android@v3
 
       - name: Setup Gradle
         if: steps.claim.outputs.has_build == 'true'
@@ -114,7 +111,7 @@ jobs:
             ls -la app/build/outputs/apk/release/
           fi
           logs=$(tail -c 50000 /tmp/build.log)
-          jq -n --arg l "\n[worker] [4/5] Gradle завершив збірку.\n$logs\n" '{appendLogs:$l}' \
+          jq -n --arg l "\n[worker] [4/5] Gradle завершив збіркг.\n$logs\n" '{appendLogs:$l}' \
             | curl -sS -X POST "$API_BASE/api/public/builds/$BUILD_ID/status" \
                 -H "Authorization: Bearer $WORKER_SECRET" -H "Content-Type: application/json" --data-binary @-
 
@@ -132,7 +129,7 @@ jobs:
           if ! "$apksigner" verify --verbose --print-certs "$apk" > /tmp/verify.log 2>&1; then
             out=$(cat /tmp/verify.log)
             jq -n --arg l "\n[worker] ❌ Перевірка підпису НЕ пройдена — файл не встановиться на телефон.\n$out\n" \
-              '{status:"failed", appendLogs:$l}' \
+             '{status:"failed", appendLogs:$l}' \
               | curl -sS -X POST "$API_BASE/api/public/builds/$BUILD_ID/status" \
                   -H "Authorization: Bearer $WORKER_SECRET" -H "Content-Type: application/json" --data-binary @-
             echo "::error::APK signature verification failed"
